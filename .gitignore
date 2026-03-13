@@ -1,0 +1,18 @@
+# Runtime data files
+latest_state.json
+latest_state.json.tmp
+live_trade_config.json
+forward_test_history.json
+signal_history.json
+
+# Model files
+*.json.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
