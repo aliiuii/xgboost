@@ -40,7 +40,7 @@ MAX_SPREAD_POINTS = 50
 MAGIC_NUMBER = 202603
 DASHBOARD_BARS = 150
 SIGNAL_LOOKBACK = 30
-REFRESH_SECONDS = 15
+REFRESH_SECONDS = 15   # Must match dashboard1.py REFRESH_SECONDS
 DATA_BARS = 500
 LOT_SIZE = 0.01
 
@@ -825,6 +825,7 @@ def compute_dashboard_data(model):
         result['warning'] = f'Chart build error: {e}'
 
     # --- 3) Tick, account, positions ---
+    tick = None
     try:
         tick = mt5.symbol_info_tick(SYMBOL)
         if tick:

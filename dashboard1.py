@@ -22,7 +22,7 @@ SYMBOL = "XAUUSDm"
 TIMEFRAME_NAME = "M15"
 DIGITS = 3
 POINT = 0.01
-REFRESH_SECONDS = 15
+REFRESH_SECONDS = 15   # Must match engine.py REFRESH_SECONDS
 PORT = 5555
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -405,9 +405,8 @@ fetchData().then(() => startCountdown());
 
 @app.route('/')
 def index():
-    # Try to read DIGITS from cache for accuracy
     cache = read_cache()
-    digits = cache.get('digits', DIGITS) if cache else DIGITS
+    digits = (cache or {}).get('digits', DIGITS)
     return render_template_string(HTML_TEMPLATE, symbol=SYMBOL, timeframe=TIMEFRAME_NAME, digits=digits, refresh=REFRESH_SECONDS)
 
 @app.route('/api/data')
