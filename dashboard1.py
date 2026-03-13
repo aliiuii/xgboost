@@ -32,6 +32,8 @@ MAGIC_NUMBER = 202603
 DASHBOARD_BARS = 150
 SIGNAL_LOOKBACK = 30
 REFRESH_SECONDS = 30
+DATA_BARS = 500          # bars used for feature engineering (was 2500, too slow)
+FIRST_LOAD_TIMEOUT = 90  # seconds to wait for first background computation
 
 PORT = 5555
 
@@ -741,8 +743,8 @@ def get_dashboard_data():
 
     # --- 1) Download candle data ---
     try:
-        df = download_data(SYMBOL, TIMEFRAME, 2500)
-        df_h1 = download_h1_data(SYMBOL, 2500)
+        df = download_data(SYMBOL, TIMEFRAME, DATA_BARS)
+        df_h1 = download_h1_data(SYMBOL, DATA_BARS)
     except Exception as e:
         df, df_h1 = None, None
         result['warning'] = f'Data download error: {e}'
@@ -859,6 +861,33 @@ def get_dashboard_data():
     # Cache successful result for fallback
     _last_good_data['data'] = result
     return result
+
+# ============================================================
+# BACKGROUND DATA CACHE
+# ============================================================
+# get_dashboard_data() is heavy (feature engineering on 500 bars).
+# Running it inside the Flask request handler causes the browser to
+# hang until Python finishes — even without a "connection timeout".
+# Fix: a background thread computes the data every REFRESH_SECONDS
+# and caches the result. The API endpoint returns the cache instantly.
+
+_bg_cache = {'data': None}
+_bg_cache_lock = threading.Lock()
+_bg_ready = threading.Event()   # set once first computation finishes
+
+def _background_worker():
+    """Runs in a daemon thread; refreshes _bg_cache every REFRESH_SECONDS."""
+    while True:
+        try:
+            data = get_dashboard_data()
+            with _bg_cache_lock:
+                _bg_cache['data'] = data
+        except Exception as e:
+            print(f"[background_worker] error: {e}")
+        finally:
+            _bg_ready.set()           # unblock the very first /api/data request
+        time.sleep(REFRESH_SECONDS)
+
 
 # ============================================================
 # FLASK APP + HTML TEMPLATE (EXACTLY SAME DESIGN)
@@ -1216,7 +1245,14 @@ def index():
 
 @app.route('/api/data')
 def api_data():
-    return jsonify(get_dashboard_data())
+    # Wait up to FIRST_LOAD_TIMEOUT s for the very first background computation
+    # to finish, then always return the cached result instantly (no blocking).
+    _bg_ready.wait(timeout=FIRST_LOAD_TIMEOUT)
+    with _bg_cache_lock:
+        data = _bg_cache['data']
+    if data is None:
+        return jsonify({'error': 'Data not yet available -- please wait and refresh', 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+    return jsonify(data)
 
 @app.route('/api/toggle_trade', methods=['POST'])
 def toggle_trade():
@@ -1238,7 +1274,12 @@ if __name__ == '__main__':
 
     model = xgb.XGBClassifier()
     model.load_model(MODEL_PATH)
-    
+
+    # Start background data-refresh thread before Flask so the cache is warm
+    bg_thread = threading.Thread(target=_background_worker, daemon=True)
+    bg_thread.start()
+    print("Background data worker started.")
+
     print(f"Starting dashboard on http://127.0.0.1:{PORT} ...")
     # threaded=False is REQUIRED! MetaTrader5 python module throws silent errors 
     # (returns None for all operations) if accessed from uninitialized side-threads
