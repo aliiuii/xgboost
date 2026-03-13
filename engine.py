@@ -41,6 +41,8 @@ MAGIC_NUMBER = 202603
 DASHBOARD_BARS = 150
 SIGNAL_LOOKBACK = 30
 REFRESH_SECONDS = 15   # Must match dashboard1.py REFRESH_SECONDS
+CANDLE_SECONDS = 15 * 60  # M15 = 900 seconds
+NEW_CANDLE_SETTLE = 2     # Seconds to wait after candle boundary for data settlement
 DATA_BARS = 500
 LOT_SIZE = 0.01
 
@@ -576,7 +578,13 @@ def build_features(df, df_h1=None):
     for col in change_cols:
         if col in feature_df.columns:
             feature_df[f'{col}_change'] = feature_df[col].diff()
-    feature_df = feature_df.dropna()
+    last_idx = feature_df.index[-1]
+    feature_df_clean = feature_df.dropna()
+    if len(feature_df_clean) == 0 or feature_df_clean.index[-1] != last_idx:
+        feature_df_filled = feature_df.ffill().fillna(0)
+        last_row = feature_df_filled.iloc[[-1]]
+        feature_df_clean = pd.concat([feature_df_clean, last_row])
+    feature_df = feature_df_clean
     all_feature_cols = list(feature_df.columns)
     for col in all_feature_cols:
         feature_df[col] = feature_df[col].clip(-10, 10)
@@ -788,6 +796,7 @@ def compute_dashboard_data(model):
         'symbol': SYMBOL, 'timeframe': TIMEFRAME_NAME,
         'digits': DIGITS, 'point': POINT,
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'generated_at': datetime.now().isoformat(),
         'candles': None, 'signals': [],
         'current_signal': {'signal': 'NONE', 'confidence': 0, 'entry': 0, 'sl': 0, 'tp': 0},
         'tick': {}, 'account': {}, 'positions': [],
@@ -909,7 +918,8 @@ def compute_dashboard_data(model):
         last_p = probs[-1]
         last_cls = int(np.argmax(last_p))
         last_atr = float(df['atr'].iloc[-1])
-        current_signal = {'signal': 'NONE', 'confidence': 0, 'entry': 0, 'sl': 0, 'tp': 0}
+        current_signal = {'signal': 'NONE', 'confidence': 0, 'entry': 0, 'sl': 0, 'tp': 0,
+                          'signal_bar': feat_df.index[-1].isoformat()}
 
         if tick and not np.isnan(last_atr) and last_atr > POINT * 10:
             spread_pts = (tick.ask - tick.bid) / POINT
@@ -929,18 +939,21 @@ def compute_dashboard_data(model):
                         'tp': float(round(entry + tp_d if sig == 'BUY' else entry - tp_d, DIGITS)),
                         'sl_pts': int(round(sl_d / POINT)),
                         'tp_pts': int(round(tp_d / POINT)),
+                        'signal_bar': feat_df.index[-1].isoformat(),
                     }
                 else:
                     current_signal = {
                         'signal': 'LOW_CONF',
                         'confidence': float(round(mp, 4)),
-                        'entry': 0, 'sl': 0, 'tp': 0
+                        'entry': 0, 'sl': 0, 'tp': 0,
+                        'signal_bar': feat_df.index[-1].isoformat(),
                     }
             elif last_cls == 2:
                 current_signal = {
                     'signal': 'HOLD',
                     'confidence': float(round(float(last_p[2]), 4)),
-                    'entry': 0, 'sl': 0, 'tp': 0
+                    'entry': 0, 'sl': 0, 'tp': 0,
+                    'signal_bar': feat_df.index[-1].isoformat(),
                 }
 
         result['current_signal'] = current_signal
@@ -958,6 +971,26 @@ def compute_dashboard_data(model):
         result['warning'] = f'ML prediction error: {e}'
 
     return result
+
+def _smart_sleep(elapsed):
+    """Sleep until next meaningful event: either REFRESH_SECONDS or a candle boundary.
+
+    If the next M15 candle boundary is within (REFRESH_SECONDS + NEW_CANDLE_SETTLE)
+    seconds, wait for that boundary + NEW_CANDLE_SETTLE instead of a fixed interval.
+    This ensures signals are generated within seconds of a new candle opening.
+    """
+    remaining = max(0, REFRESH_SECONDS - elapsed)
+    now = time.time()
+    next_boundary = (now // CANDLE_SECONDS + 1) * CANDLE_SECONDS
+    time_to_boundary = next_boundary - now
+
+    if time_to_boundary <= remaining + NEW_CANDLE_SETTLE:
+        sleep_time = time_to_boundary + NEW_CANDLE_SETTLE
+    else:
+        sleep_time = remaining
+
+    if sleep_time > 0:
+        time.sleep(sleep_time)
 
 # ============================================================
 # MAIN
@@ -991,12 +1024,26 @@ def main():
     print(f"Cache: {CACHE_PATH}")
     print("-" * 50)
 
+    prev_candle_time = None
+
     while True:
+        elapsed = 0
         try:
             t0 = time.time()
             data = compute_dashboard_data(model)
             elapsed = time.time() - t0
             atomic_write_json(CACHE_PATH, data)
+
+            # Detect new candle and recompute immediately for freshest signal
+            candle_times = (data.get('candles') or {}).get('time')
+            current_candle_time = candle_times[-1] if candle_times else None
+            if prev_candle_time is not None and current_candle_time != prev_candle_time:
+                print(f"[{datetime.now():%H:%M:%S}] New candle detected: {current_candle_time}, recomputing...")
+                t0 = time.time()
+                data = compute_dashboard_data(model)
+                elapsed = time.time() - t0
+                atomic_write_json(CACHE_PATH, data)
+            prev_candle_time = current_candle_time
 
             sig = data.get('current_signal', {}).get('signal', 'N/A')
             conf = data.get('current_signal', {}).get('confidence', 0)
@@ -1014,7 +1061,7 @@ def main():
             print(f"[{datetime.now():%H:%M:%S}] ERROR: {e}")
             traceback.print_exc()
 
-        time.sleep(REFRESH_SECONDS)
+        _smart_sleep(elapsed)
 
 
 if __name__ == '__main__':
