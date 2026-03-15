@@ -453,7 +453,7 @@ async function manualTrade(action) {
           _enableManualBtns();
           fetchData();
         }
-      } catch(e) {}
+      } catch(e) { console.error('Poll error:', e); }
     }, 2000);
   } catch (e) {
     statusEl.textContent = 'Network error: ' + e.message;

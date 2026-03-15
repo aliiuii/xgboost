@@ -763,16 +763,17 @@ def execute_manual_trade(action):
     # Calculate ATR for SL/TP from recent candle data
     atr_val = None
     try:
-        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 20)
+        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 30)
         if rates is not None and len(rates) >= 15:
             rdf = pd.DataFrame(rates)
             h, l, c = rdf['high'].values, rdf['low'].values, rdf['close'].values
             cs = np.roll(c, 1); cs[0] = c[0]
             tr = np.maximum(h - l, np.maximum(np.abs(h - cs), np.abs(l - cs)))
             tr[0] = h[0] - l[0]
-            atr_val = float(pd.Series(tr).rolling(14).mean().values[-1])
-            if np.isnan(atr_val) or atr_val < POINT * 10:
-                atr_val = None
+            atr_series = pd.Series(tr).rolling(14).mean().values
+            last_atr = atr_series[-1]
+            if not np.isnan(last_atr) and last_atr >= POINT * 10:
+                atr_val = float(last_atr)
     except Exception:
         pass
     if atr_val is None:
