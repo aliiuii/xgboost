@@ -32,6 +32,8 @@ CACHE_PATH = os.path.join(BASE_DIR, "latest_state.json")
 LIVE_TRADE_CONFIG = os.path.join(BASE_DIR, "live_trade_config.json")
 FORWARD_TEST_FILE = os.path.join(BASE_DIR, "forward_test_history.json")
 SIGNAL_HISTORY_FILE = os.path.join(BASE_DIR, "signal_history.json")
+MANUAL_TRADE_CMD = os.path.join(BASE_DIR, "manual_trade_cmd.json")
+MANUAL_TRADE_RESULT = os.path.join(BASE_DIR, "manual_trade_result.json")
 
 SL_ATR_MULT = 2.5
 RR_RATIO = 2.0
@@ -703,14 +705,20 @@ def get_forward_test_summary():
 def execute_trade(signal_data, bar_time):
     global last_trade_bar_time
     if last_trade_bar_time == bar_time:
+        print(f"  Auto-trade skipped: already traded this bar ({bar_time})")
         return
 
     open_pos = mt5.positions_get(symbol=SYMBOL)
     if open_pos is not None and len([p for p in open_pos if p.magic == MAGIC_NUMBER]) >= 1:
+        print(f"  Auto-trade skipped: position already open")
         return
 
     order_type = mt5.ORDER_TYPE_BUY if signal_data['signal'] == 'BUY' else mt5.ORDER_TYPE_SELL
-    price = mt5.symbol_info_tick(SYMBOL).ask if order_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(SYMBOL).bid
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        print(f"  Auto-trade failed: cannot get tick data (market closed?)")
+        return
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -728,11 +736,127 @@ def execute_trade(signal_data, bar_time):
     }
 
     result = mt5.order_send(request)
+    if result is None:
+        print(f"  Auto-trade failed: order_send returned None, last_error={mt5.last_error()}")
+        return
     if result.retcode == mt5.TRADE_RETCODE_DONE:
         last_trade_bar_time = bar_time
         print(f"  Trade executed: {signal_data['signal']} at {price}")
     else:
         print(f"  Trade failed: {result.retcode} - {result.comment}")
+
+
+def execute_manual_trade(action):
+    """Execute a manual BUY or SELL trade via MT5. Returns result dict."""
+    ts = datetime.now().isoformat()
+
+    if action not in ('BUY', 'SELL'):
+        return {'status': 'error', 'reason': f'Invalid action: {action}', 'timestamp': ts}
+
+    if not mt5.initialize():
+        return {'status': 'error', 'reason': 'MT5 not connected', 'timestamp': ts}
+
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return {'status': 'error', 'reason': 'Cannot get tick data (market closed?)', 'timestamp': ts}
+
+    # Calculate ATR for SL/TP from recent candle data
+    atr_val = None
+    try:
+        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 30)
+        if rates is not None and len(rates) >= 15:
+            rdf = pd.DataFrame(rates)
+            h, l, c = rdf['high'].values, rdf['low'].values, rdf['close'].values
+            cs = np.roll(c, 1); cs[0] = c[0]
+            tr = np.maximum(h - l, np.maximum(np.abs(h - cs), np.abs(l - cs)))
+            tr[0] = h[0] - l[0]
+            atr_series = pd.Series(tr).rolling(14).mean().values
+            last_atr = atr_series[-1]
+            if not np.isnan(last_atr) and last_atr >= POINT * 10:
+                atr_val = float(last_atr)
+    except Exception:
+        pass
+    if atr_val is None:
+        atr_val = POINT * 500  # fallback
+
+    sl_dist = atr_val * SL_ATR_MULT
+    tp_dist = sl_dist * RR_RATIO
+
+    order_type = mt5.ORDER_TYPE_BUY if action == 'BUY' else mt5.ORDER_TYPE_SELL
+    price = tick.ask if action == 'BUY' else tick.bid
+
+    if action == 'BUY':
+        sl = round(price - sl_dist, DIGITS)
+        tp = round(price + tp_dist, DIGITS)
+    else:
+        sl = round(price + sl_dist, DIGITS)
+        tp = round(price - tp_dist, DIGITS)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": LOT_SIZE,
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "deviation": MAX_SPREAD_POINTS,
+        "magic": MAGIC_NUMBER,
+        "comment": "XGB Manual",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    res = mt5.order_send(request)
+    if res is None:
+        reason = f'order_send returned None: {mt5.last_error()}'
+        print(f"  Manual trade failed: {reason}")
+        return {'status': 'error', 'reason': reason, 'timestamp': ts}
+
+    if res.retcode == mt5.TRADE_RETCODE_DONE:
+        msg = f'Manual {action} at {round(price, DIGITS)}, SL={sl}, TP={tp}'
+        print(f"  {msg}")
+        return {
+            'status': 'success', 'message': msg,
+            'action': action, 'price': round(price, DIGITS),
+            'sl': sl, 'tp': tp, 'volume': LOT_SIZE,
+            'timestamp': ts,
+        }
+    else:
+        reason = f'retcode={res.retcode} - {res.comment}'
+        print(f"  Manual trade failed: {reason}")
+        return {'status': 'error', 'reason': reason, 'timestamp': ts}
+
+
+def process_manual_trade_commands():
+    """Check for and process manual trade commands from the dashboard."""
+    try:
+        if not os.path.exists(MANUAL_TRADE_CMD):
+            return
+        with open(MANUAL_TRADE_CMD, 'r') as f:
+            cmd = json.load(f)
+        # Delete command file immediately to prevent re-processing
+        try:
+            os.remove(MANUAL_TRADE_CMD)
+        except OSError:
+            pass
+
+        action = cmd.get('action', '').upper()
+        if action in ('BUY', 'SELL'):
+            result = execute_manual_trade(action)
+        else:
+            result = {'status': 'error', 'reason': f'Invalid action: {action}',
+                      'timestamp': datetime.now().isoformat()}
+        # Write result for dashboard to poll
+        atomic_write_json(MANUAL_TRADE_RESULT, result)
+    except (json.JSONDecodeError, IOError, OSError) as e:
+        try:
+            os.remove(MANUAL_TRADE_CMD)
+        except OSError:
+            pass
+        result = {'status': 'error', 'reason': f'Command read error: {e}',
+                  'timestamp': datetime.now().isoformat()}
+        atomic_write_json(MANUAL_TRADE_RESULT, result)
 
 def get_mt5_history_summary():
     from_date = datetime.now() - timedelta(days=30)
@@ -1029,6 +1153,9 @@ def main():
     while True:
         elapsed = 0
         try:
+            # Process manual trade commands before computing data
+            process_manual_trade_commands()
+
             t0 = time.time()
             data = compute_dashboard_data(model)
             elapsed = time.time() - t0

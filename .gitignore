@@ -4,6 +4,8 @@ latest_state.json.tmp
 live_trade_config.json
 forward_test_history.json
 signal_history.json
+manual_trade_cmd.json
+manual_trade_result.json
 
 # Model files
 *.json.tmp

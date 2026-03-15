@@ -13,7 +13,7 @@ Then start this dashboard:
 
 import os, json
 from datetime import datetime
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 # ============================================================
 # CONFIG
@@ -28,6 +28,8 @@ PORT = 5555
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(_BASE_DIR, "latest_state.json")
 LIVE_TRADE_CONFIG = os.path.join(_BASE_DIR, "live_trade_config.json")
+MANUAL_TRADE_CMD = os.path.join(_BASE_DIR, "manual_trade_cmd.json")
+MANUAL_TRADE_RESULT = os.path.join(_BASE_DIR, "manual_trade_result.json")
 
 # ============================================================
 # CACHE READING
@@ -185,6 +187,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="data-row"><span class="data-label">SL dist</span><span id="sigSLPts" class="data-value">-</span></div>
         <div class="data-row"><span class="data-label">TP dist</span><span id="sigTPPts" class="data-value">-</span></div>
       </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Manual Trade</div>
+      <div style="display:flex;gap:8px;">
+        <button id="manualBuyBtn" onclick="manualTrade('BUY')" style="flex:1;padding:10px;background:rgba(0,255,136,0.15);color:#00ff88;border:1px solid #00ff8844;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:opacity 0.2s;">&#x25B2; BUY</button>
+        <button id="manualSellBtn" onclick="manualTrade('SELL')" style="flex:1;padding:10px;background:rgba(255,51,102,0.15);color:#ff3366;border:1px solid #ff336644;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:opacity 0.2s;">&#x25BC; SELL</button>
+      </div>
+      <div id="manualTradeStatus" style="margin-top:8px;font-size:11px;font-family:'JetBrains Mono',monospace;text-align:center;min-height:16px;color:#666;">SL/TP auto-calculated from ATR</div>
     </div>
 
     <div class="panel">
@@ -397,6 +408,65 @@ async function toggleLiveTrade() {
     fetchData(); // refresh UI immediately
   } catch (e) { console.error('Toggle error', e); } 
 }
+let _manualPollTimer = null;
+async function manualTrade(action) {
+  document.getElementById('manualBuyBtn').disabled = true;
+  document.getElementById('manualSellBtn').disabled = true;
+  document.getElementById('manualBuyBtn').style.opacity = '0.5';
+  document.getElementById('manualSellBtn').style.opacity = '0.5';
+  let statusEl = document.getElementById('manualTradeStatus');
+  statusEl.textContent = 'Sending ' + action + '... waiting for engine';
+  statusEl.style.color = '#ffd700';
+  try {
+    let r = await fetch('/api/manual_trade', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action: action})});
+    let d = await r.json();
+    if (d.status !== 'sent') {
+      statusEl.textContent = '\u2717 ' + (d.reason || 'Unknown error');
+      statusEl.style.color = '#ff3366';
+      _enableManualBtns();
+      return;
+    }
+    let cmdTs = d.timestamp;
+    let polls = 0;
+    if (_manualPollTimer) clearInterval(_manualPollTimer);
+    _manualPollTimer = setInterval(async () => {
+      polls++;
+      if (polls > 30) {
+        clearInterval(_manualPollTimer);
+        statusEl.textContent = 'Timeout \u2014 engine may not be running';
+        statusEl.style.color = '#ff3366';
+        _enableManualBtns();
+        return;
+      }
+      try {
+        let rr = await fetch('/api/manual_trade_result');
+        let dd = await rr.json();
+        if (dd && dd.timestamp && dd.timestamp >= cmdTs) {
+          clearInterval(_manualPollTimer);
+          if (dd.status === 'success') {
+            statusEl.textContent = '\u2713 ' + dd.message;
+            statusEl.style.color = '#00ff88';
+          } else {
+            statusEl.textContent = '\u2717 ' + (dd.reason || 'Unknown error');
+            statusEl.style.color = '#ff3366';
+          }
+          _enableManualBtns();
+          fetchData();
+        }
+      } catch(e) { console.error('Poll error:', e); }
+    }, 2000);
+  } catch (e) {
+    statusEl.textContent = 'Network error: ' + e.message;
+    statusEl.style.color = '#ff3366';
+    _enableManualBtns();
+  }
+}
+function _enableManualBtns() {
+  document.getElementById('manualBuyBtn').disabled = false;
+  document.getElementById('manualSellBtn').disabled = false;
+  document.getElementById('manualBuyBtn').style.opacity = '1';
+  document.getElementById('manualSellBtn').style.opacity = '1';
+}
 function startCountdown() { countdownVal = REFRESH; document.getElementById('countdown').textContent = countdownVal; let t = setInterval(() => { countdownVal--; document.getElementById('countdown').textContent = Math.max(0, countdownVal); if (countdownVal <= 0) { clearInterval(t); fetchData().then(() => startCountdown()); } }, 1000); }
 fetchData().then(() => startCountdown());
 </script>
@@ -444,6 +514,35 @@ def toggle_trade():
     except Exception:
         pass
     return jsonify({'status': 'success', 'live_trade_enabled': enabled})
+
+@app.route('/api/manual_trade', methods=["POST"])
+def manual_trade():
+    """Write a manual trade command for engine.py to process."""
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        body = {}
+    action = (body.get('action') or '').upper()
+    if action not in ('BUY', 'SELL'):
+        return jsonify({'status': 'error', 'reason': f'Invalid action: {action}'})
+    ts = datetime.now().isoformat()
+    try:
+        with open(MANUAL_TRADE_CMD, 'w') as f:
+            json.dump({'action': action, 'timestamp': ts}, f)
+    except Exception as e:
+        return jsonify({'status': 'error', 'reason': f'Failed to write command: {e}'})
+    return jsonify({'status': 'sent', 'action': action, 'timestamp': ts})
+
+@app.route('/api/manual_trade_result')
+def manual_trade_result():
+    """Return the latest manual trade result from engine.py."""
+    try:
+        if os.path.exists(MANUAL_TRADE_RESULT):
+            with open(MANUAL_TRADE_RESULT, 'r') as f:
+                return jsonify(json.load(f))
+    except (json.JSONDecodeError, IOError):
+        pass
+    return jsonify(None)
 
 # ============================================================
 # MAIN
